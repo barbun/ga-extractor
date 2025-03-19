@@ -1,25 +1,40 @@
+# Standard libraries
 import json
 import uuid
+from datetime import datetime, timedelta
+from enum import Enum
+from pathlib import Path
+from typing import Optional, NamedTuple
 
+# Third-party lib
 import typer
 import validators
-from googleapiclient.discovery import build
-from google.oauth2 import service_account
 import yaml
-from datetime import datetime, timedelta
-from pathlib import Path
-from enum import Enum
-from typing import Optional, NamedTuple
+import pycountry
+from google.analytics.data_v1beta import BetaAnalyticsDataClient
+from google.analytics.data_v1beta.types import (
+    DateRange,
+    Dimension,
+    Metric,
+    RunReportRequest,
+)
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 extractor = typer.Typer()
 APP_NAME = "ga-extractor"
 
+# Constants
+PAGEVIEW_EVENT_TYPE = 1
+MAX_BROWSER_LENGTH = 20
+DEFAULT_COUNTRY_CODE = 'XX'
 
-class SamplingLevel(str, Enum):
-    SAMPLING_UNSPECIFIED = "SAMPLING_UNSPECIFIED"
-    DEFAULT = "DEFAULT"
-    SMALL = "SMALL"
-    LARGE = "LARGE"
+
+def escape_sql_string(s: str) -> str:
+    """Escape single quotes in strings for SQL."""
+    if s is None:
+        return ""
+    return s.replace("'", "''")
 
 
 class OutputFormat(str, Enum):
@@ -46,8 +61,8 @@ class Preset(str, Enum):
     def metrics(p):
         metrics_mapping = {
             Preset.NONE: [],
-            Preset.FULL: ["ga:pageviews", "ga:sessions"],
-            Preset.BASIC: ["ga:pageviews"],
+            Preset.FULL: ["screenPageViews", "sessions"],
+            Preset.BASIC: ["screenPageViews"],
         }
         return metrics_mapping[p]
 
@@ -55,24 +70,25 @@ class Preset(str, Enum):
     def dims(p):
         dims_mapping = {
             Preset.NONE: [],
-            Preset.FULL: ["ga:pagePath", "ga:browser", "ga:operatingSystem", "ga:deviceCategory", "ga:browserSize",
-                          "ga:language", "ga:country", "ga:fullReferrer"],
-            Preset.BASIC: ["ga:pagePath"],
+            Preset.FULL: ["pagePath", "browser", "operatingSystem", "deviceCategory", "screenResolution",
+                          "language", "country", "sessionSource"],
+            Preset.BASIC: ["pagePath"],
         }
         return dims_mapping[p]
 
 
 @extractor.command()
-def setup(metrics: str = typer.Option(None, "--metrics"),
-          dimensions: str = typer.Option(None, "--dimensions"),
-          sa_key_path: str = typer.Option(..., "--sa-key-path"),
-          table_id: int = typer.Option(..., "--table-id"),
-          sampling_level: SamplingLevel = typer.Option(SamplingLevel.DEFAULT, "--sampling-level"),
-          preset: Preset = typer.Option(Preset.NONE, "--preset",
-                                        help="Use metrics and dimension preset (can't be specified with '--dimensions' or '--metrics')"),
-          start_date: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
-          end_date: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
-          dry_run: bool = typer.Option(False, "--dry-run", help="Outputs config to terminal instead of config file")):
+def setup(
+    metrics: str = typer.Option(None, "--metrics"),
+    dimensions: str = typer.Option(None, "--dimensions"),
+    sa_key_path: str = typer.Option(..., "--sa-key-path"),
+    property_id: int = typer.Option(..., "--property-id", help="Google Analytics 4 property ID"),
+    preset: Preset = typer.Option(Preset.NONE, "--preset",
+                                help="Use metrics and dimension preset (can't be specified with '--dimensions' or '--metrics')"),
+    start_date: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
+    end_date: datetime = typer.Option(..., formats=["%Y-%m-%d"]),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Outputs config to terminal instead of config file")
+):
     """
     Generate configuration file from arguments
     """
@@ -86,10 +102,9 @@ def setup(metrics: str = typer.Option(None, "--metrics"),
 
     config = {
         "serviceAccountKeyPath": sa_key_path,
-        "table": table_id,
+        "property": property_id,
         "metrics": "" if not metrics else metrics.split(","),
         "dimensions": "" if not dimensions else dimensions.split(","),
-        "samplingLevel": sampling_level.value,
         "startDate": f"{start_date:%Y-%m-%d}",
         "endDate": f"{end_date:%Y-%m-%d}",
     }
@@ -135,95 +150,102 @@ def extract(report: Optional[Path] = typer.Option("report.json", dir_okay=True))
     """
     Extracts data based on the config
     """
-    # https://developers.google.com/analytics/devguides/reporting/core/v4/rest/v4/reports/batchGet
-
     app_dir = typer.get_app_dir(APP_NAME)
     config_path: Path = Path(app_dir) / "config.yaml"
     output_path: Path = Path(app_dir) / report
     if not config_path.is_file():
         typer.echo("Config file doesn't exist yet. Please run 'setup' command first.")
         typer.Exit(2)
+    
     with config_path.open() as file:
         config = yaml.safe_load(file)
-        credentials = service_account.Credentials.from_service_account_file(config["serviceAccountKeyPath"])
-        scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/analytics.readonly'])
+        credentials = service_account.Credentials.from_service_account_file(
+            config["serviceAccountKeyPath"],
+            scopes=['https://www.googleapis.com/auth/analytics.readonly']
+        )
 
-        dimensions = [{"name": d} for d in config['dimensions']]
-        metrics = [{"expression": m} for m in config['metrics']]
-        body = {"reportRequests": [
-                    {
-                        # "pageSize": 2,  # Use this to test paging
-                        "viewId": f"{config['table']}",
-                        "dateRanges": [
-                            {
-                                "startDate": f"{config['startDate']}",
-                                "endDate": f"{config['endDate']}"
-                            }],
-                        "dimensions": [dimensions],
-                        "metrics": [metrics],
-                        "samplingLevel": config['samplingLevel']
-                    }]}
+        dimensions = [Dimension(name=d) for d in config['dimensions']]
+        metrics = [Metric(name=m) for m in config['metrics']]
+        
+        client = BetaAnalyticsDataClient(credentials=credentials)
+        
+        request = RunReportRequest(
+            property=f"properties/{config['property']}",
+            dimensions=dimensions,
+            metrics=metrics,
+            date_ranges=[DateRange(
+                start_date=config['startDate'],
+                end_date=config['endDate']
+            )],
+        )
+
         rows = []
-        with build('analyticsreporting', 'v4', credentials=scoped_credentials) as service:
-            response = service.reports().batchGet(body=body).execute()
-            if not "rows" in response.values():
-                raise Exception("There were no rows in the response.")
-            rows.extend(response["reports"][0]["data"]["rows"])
+        response = client.run_report(request)
+        
+        # Transform response to match expected format
+        for row in response.rows:
+            dimension_values = [dim_value.value for dim_value in row.dimension_values]
+            metric_values = [{"values": [str(metric_value.value) for metric_value in row.metric_values]}]
+            rows.append({
+                "dimensions": dimension_values,
+                "metrics": metric_values
+            })
 
-            while "nextPageToken" in response["reports"][0]:  # Paging...
-                body["reportRequests"][0]["pageToken"] = response["reports"][0]["nextPageToken"]
-                response = service.reports().batchGet(body=body).execute()
-                rows.extend(response["reports"][0]["data"]["rows"])
-
-            output_path.write_text(json.dumps(rows))
+        output_path.write_text(json.dumps(rows))
         typer.echo(f"Report written to {output_path.absolute()}")
 
 
 @extractor.command()
-def migrate(output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
-            umami_website_id: int = typer.Argument(1, help="Website ID, used if migrating data for Umami Analytics"),
-            umami_hostname: str = typer.Argument("localhost", help="Hostname website being migrated, used if migrating data for Umami Analytics")):
-    """
-    Export necessary data and transform it to format for target environment (Umami, ...)
+def migrate(
+    output_format: OutputFormat = typer.Option(OutputFormat.JSON, "--format"),
+    umami_website_id: Optional[uuid.UUID] = typer.Option(None, "--umami-website-id", help="Website ID from Umami (required for Umami format)"),
+    umami_hostname: Optional[str] = typer.Option(None, "--umami-hostname", help="Hostname for the website in Umami (required for Umami format)")
+):
+    """Export necessary data and transform it to format for target environment."""
+    try:
+        app_dir = typer.get_app_dir(APP_NAME)
+        config_path: Path = Path(app_dir) / "config.yaml"
+        output_path: Path = Path(app_dir) / f"{uuid.uuid4()}_extract.{OutputFormat.file_suffix(output_format)}"
+        
+        if output_format == OutputFormat.UMAMI and (not umami_website_id or not umami_hostname):
+            typer.echo("For Umami format, both --umami-website-id and --umami-hostname must be provided")
+            raise typer.Exit(1)
 
-    Old sessions won't be preserved because session can span multiple days, but extraction is done on daily level.
+        with config_path.open() as file:
+            config = yaml.safe_load(file)
+            credentials = service_account.Credentials.from_service_account_file(config["serviceAccountKeyPath"])
+            scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/analytics.readonly'])
 
-    Bounce rate and session duration won't be accurate.
-    Views and visitors on day-level granularity will be accurate.
-    Exact visit time is (hour and minute) is not preserved.
-    """
+            date_ranges = _migrate_date_ranges(config['startDate'], config['endDate'])
+            rows = _migrate_extract(scoped_credentials, config['property'], date_ranges)
 
-    app_dir = typer.get_app_dir(APP_NAME)
-    config_path: Path = Path(app_dir) / "config.yaml"
-    output_path: Path = Path(app_dir) / f"{uuid.uuid4()}_extract.{OutputFormat.file_suffix(output_format)}"
-    if not config_path.is_file():
+            if output_format == OutputFormat.UMAMI:
+                data = _migrate_transform_umami(rows, umami_website_id, umami_hostname)
+                
+                with output_path.open(mode="w") as f:
+                    for insert in data:
+                        f.write(f"{insert}\n")
+            elif output_format == OutputFormat.JSON:
+                output_path.write_text(json.dumps(rows))
+            elif output_format == OutputFormat.CSV:
+                data = _migrate_transform_csv(rows)
+                with output_path.open(mode="w") as f:
+                    for row in data:
+                        f.write(f"{row}\n")
+
+            typer.echo(f"Report written to {output_path.absolute()}")
+    except FileNotFoundError:
         typer.echo("Config file doesn't exist yet. Please run 'setup' command first.")
-        typer.Exit(2)
-    with config_path.open() as file:
-        config = yaml.safe_load(file)
-        credentials = service_account.Credentials.from_service_account_file(config["serviceAccountKeyPath"])
-        scoped_credentials = credentials.with_scopes(['https://www.googleapis.com/auth/analytics.readonly'])
-
-        date_ranges = __migrate_date_ranges(config['startDate'], config['endDate'])
-        rows = __migrate_extract(scoped_credentials, config['table'], date_ranges)
-
-        if output_format == OutputFormat.UMAMI:
-            data = __migrate_transform_umami(rows, umami_website_id, umami_hostname)
-            with output_path.open(mode="w") as f:
-                for insert in data:
-                    f.write(f"{insert}\n")
-        elif output_format == OutputFormat.JSON:
-            output_path.write_text(json.dumps(rows))
-        elif output_format == OutputFormat.CSV:
-            data = __migrate_transform_csv(rows)
-            with output_path.open(mode="w") as f:
-                for row in data:
-                    f.write(f"{row}\n")
-
-        typer.echo(f"Report written to {output_path.absolute()}")
+        raise typer.Exit(2)
+    except yaml.YAMLError:
+        typer.echo("Invalid config file format")
+        raise typer.Exit(3)
 
 
-def __migrate_date_ranges(start_date, end_date):
+def _migrate_date_ranges(
+    start_date: str,
+    end_date: str
+) -> list[dict[str, str]]:
     start_date = datetime.strptime(start_date, '%Y-%m-%d')
     end_date = datetime.strptime(end_date, '%Y-%m-%d')
     date_ranges = [{"startDate": f"{start_date + timedelta(days=d):%Y-%m-%d}",
@@ -232,127 +254,200 @@ def __migrate_date_ranges(start_date, end_date):
     return date_ranges
 
 
-def __migrate_extract(credentials, table_id, date_ranges):
-    dimensions = ["ga:pagePath", "ga:browser", "ga:operatingSystem", "ga:deviceCategory", "ga:browserSize", "ga:language", "ga:country", "ga:fullReferrer"]
-    metrics = ["ga:pageviews", "ga:sessions"]
+def _migrate_extract(credentials, property_id, date_ranges):
+    dimensions = ["pagePath", "browser", "operatingSystem", "deviceCategory", "screenResolution", 
+                 "language", "country", "sessionSource"]
+    metrics = ["screenPageViews", "sessions"]
 
-    body = {"reportRequests": [
-        {
-            "viewId": f"{table_id}",
-            "dimensions": [{"name": d} for d in dimensions],
-            "metrics": [{"expression": m} for m in metrics]
-        }]}
-
+    client = BetaAnalyticsDataClient(credentials=credentials)
     rows = {}
-    for r in date_ranges:
-        with build('analyticsreporting', 'v4', credentials=credentials) as service:
-            body["reportRequests"][0]["dateRanges"] = [r]
-            response = service.reports().batchGet(body=body).execute()
 
-            rows[r["startDate"]] = response["reports"][0]["data"]["rows"]
+    for date_range in date_ranges:
+        request = RunReportRequest(
+            property=f"properties/{property_id}",
+            dimensions=[Dimension(name=d) for d in dimensions],
+            metrics=[Metric(name=m) for m in metrics],
+            date_ranges=[DateRange(
+                start_date=date_range["startDate"],
+                end_date=date_range["endDate"]
+            )],
+        )
+
+        response = client.run_report(request)
+        
+        # Transform response to match expected format
+        daily_rows = []
+        for row in response.rows:
+            dimension_values = [dim_value.value for dim_value in row.dimension_values]
+            metric_values = [{"values": [str(metric_value.value) for metric_value in row.metric_values]}]
+            daily_rows.append({
+                "dimensions": dimension_values,
+                "metrics": metric_values
+            })
+        
+        rows[date_range["startDate"]] = daily_rows
 
     return rows
 
 
 class Session(NamedTuple):
-    session_id: int
-    session_uuid: uuid.UUID
-    website_id: int
-    created_at: str
+    """Represents a user session in Umami analytics."""
+    session_id: uuid.UUID
+    website_id: uuid.UUID
+    created_at: int
     hostname: str
     browser: str
     os: str
     device: str
     screen: str
     language: str
+    country: str
 
     def sql(self):
-        session_insert = (
-            f"INSERT INTO public.session (session_id, session_uuid, website_id, created_at, hostname, browser, os, device, screen, language, country) "
-            f"VALUES ({self.session_id}, '{self.session_uuid}', {self.website_id}, '{self.created_at}', '{self.hostname}', '{self.browser[:20]}', '{self.os}', '{self.device}', '{self.screen}', '{self.language}', NULL);"
+        dt = datetime.fromtimestamp(self.created_at // 1000).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Get country code directly using pycountry
+        try:
+            if found := pycountry.countries.get(name=self.country):
+                country_code = found.alpha_2
+            elif found := pycountry.countries.search_fuzzy(self.country):
+                country_code = found[0].alpha_2
+            else:
+                country_code = DEFAULT_COUNTRY_CODE
+        except LookupError:
+            country_code = DEFAULT_COUNTRY_CODE
+
+        # Ensure country_code is always 2 characters
+        country_code = country_code[:2]
+        
+        # Truncate OS field to 20 chars to fix SQL error and handle potential escaping
+        safe_os = self.os[:20].replace("'", "''") if self.os else ""
+        
+        return (
+            f"INSERT INTO session (session_id, website_id, created_at, hostname, browser, os, "
+            f"device, screen, language, country) VALUES ('{self.session_id}', '{self.website_id}', '{dt}', "
+            f"'{self.hostname}', '{self.browser[:MAX_BROWSER_LENGTH]}', '{safe_os}', "
+            f"'{self.device}', '{self.screen}', "
+            f"'{self.language}', '{country_code}');"
         )
-        return session_insert
 
 
 class PageView(NamedTuple):
-    id: int
-    website_id: int
-    session_id: int
-    created_at: str
-    url: str
-    referral_path: str
+    event_id: uuid.UUID
+    website_id: uuid.UUID
+    session_id: uuid.UUID
+    created_at: int  # timestamp in milliseconds
+    url_path: str
+    referrer_path: str
 
     def sql(self):
-        return f"INSERT INTO public.pageview (view_id, website_id, session_id, created_at, url, referrer) VALUES ({self.id}, {self.website_id}, {self.session_id}, '{self.created_at}', '{self.url}', '{self.referral_path}');"
+        dt = datetime.fromtimestamp(self.created_at // 1000).strftime('%Y-%m-%d %H:%M:%S')
+        
+        # Escape string values
+        safe_url_path = escape_sql_string(self.url_path)
+        safe_referrer_path = escape_sql_string(self.referrer_path)
+        
+        return (
+            f"INSERT INTO website_event (event_id, website_id, session_id, visit_id, created_at, url_path, referrer_path, event_type) "
+            f"VALUES ('{self.event_id}', '{self.website_id}', '{self.session_id}', '{self.session_id}', '{dt}', "
+            f"'{safe_url_path}', '{safe_referrer_path}', {PAGEVIEW_EVENT_TYPE});"
+        )
 
 
-def __migrate_transform_umami(rows,  website_id, hostname):
-
-    # Sample row:
-    # {'dimensions': ['/', 'Chrome', 'Windows', 'desktop', '1350x610', 'en-us', 'India', '(direct)'], 'metrics': [{'values': ['1', '1']}]}
-    #
-    # Notes: there can be 0 sessions in the record; there's always more or equal number of views
-    #        - treat zero sessions as one
-    #        - if sessions is non-zero and page views are > 1, then divide, e.g.:
-    #           - 5, 5 - 5 sessions, 1 view each
-    #           - 4, 2 - 2 sessions, 2 views each
-    #           - 5, 3 - 3 sessions, 2x1 view, 1x3 views
-
-    page_view_id = 1
-    session_id = 1
+def _migrate_transform_umami(
+    rows: dict,
+    website_id: uuid.UUID,
+    hostname: str
+) -> list[str]:
+    """Transform GA data into Umami-compatible SQL inserts"""
+    
     sql_inserts = []
     for day, value in rows.items():
         for row in value:
-            timestamp = f"{day} 00:00:00.000+00"  # PostgreSQL-style "timestamp with timezone"
+            # Convert YYYY-MM-DD to millisecond timestamp
+            timestamp_ms = int(datetime.strptime(f"{day} 00:00:00", "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
+            
+            # Process referrer
             referrer = f"https://{row['dimensions'][7]}"
             if not validators.url(referrer):
                 referrer = ""
             elif referrer == "google":
                 referrer = "https://google.com"
 
-            language = row["dimensions"][5][:2]
+            # Extract common data
             page_views, sessions = map(int, row["metrics"][0]["values"])
             sessions = max(sessions, 1)  # in case it's zero
+            url_path = row["dimensions"][0]
+            browser = row["dimensions"][1]
+            os_name = row["dimensions"][2]
+            device = row["dimensions"][3]
+            screen = row["dimensions"][4]
+            language = row["dimensions"][5][:2].lower()  # Ensure lowercase 2-letter code
+            country = row["dimensions"][6]
+            
+            # Create session and page view objects based on distribution pattern
             if page_views == sessions:  # One page view for each session
-                for i in range(sessions):
-                    s = Session(session_uuid=uuid.uuid4(), session_id=session_id, website_id=website_id, created_at=timestamp, hostname=hostname,
-                                browser=row["dimensions"][1], os=row["dimensions"][2], device=row["dimensions"][3], screen=row["dimensions"][4],
-                                language=language)
-                    p = PageView(id=page_view_id, website_id=website_id, session_id=session_id, created_at=timestamp, url=row["dimensions"][0], referral_path=referrer)
-                    sql_inserts.extend([s.sql(), p.sql()])
-                    session_id += 1
-                    page_view_id += 1
+                for _ in range(sessions):
+                    session_id = uuid.uuid4()
+                    
+                    # Add one session with one page view
+                    sql_inserts.append(Session(
+                        session_id=session_id, website_id=website_id, created_at=timestamp_ms,
+                        hostname=hostname, browser=browser, os=os_name, device=device,
+                        screen=screen, language=language, country=country
+                    ).sql())
+                    
+                    sql_inserts.append(PageView(
+                        event_id=uuid.uuid4(), website_id=website_id, session_id=session_id,
+                        created_at=timestamp_ms, url_path=url_path, referrer_path=referrer
+                    ).sql())
 
             elif page_views % sessions == 0:  # Split equally
-                for i in range(sessions):
-                    s = Session(session_uuid=uuid.uuid4(), session_id=session_id, website_id=website_id, created_at=timestamp, hostname=hostname,
-                                browser=row["dimensions"][1], os=row["dimensions"][2], device=row["dimensions"][3], screen=row["dimensions"][4],
-                                language=language)
-                    sql_inserts.append(s.sql())
-                    for j in range(page_views // sessions):
-                        p = PageView(id=page_view_id, website_id=website_id, session_id=session_id, created_at=timestamp, url=row["dimensions"][0], referral_path=referrer)
-                        sql_inserts.append(p.sql())
-                        page_view_id += 1
-                    session_id += 1
-            else:  # One page view for each, rest for the last session
-                for i in range(sessions):
-                    s = Session(session_uuid=uuid.uuid4(), session_id=session_id, website_id=website_id, created_at=timestamp, hostname=hostname,
-                                browser=row["dimensions"][1], os=row["dimensions"][2], device=row["dimensions"][3], screen=row["dimensions"][4],
-                                language=language)
-                    p = PageView(id=page_view_id, website_id=website_id, session_id=session_id, created_at=timestamp, url=row["dimensions"][0], referral_path=referrer)
-                    sql_inserts.extend([s.sql(), p.sql()])
-                    session_id += 1
-                    page_view_id += 1
-                last_session_id = session_id - 1
-                for i in range(page_views - sessions):
-                    p = PageView(id=page_view_id, website_id=website_id, session_id=last_session_id, created_at=timestamp, url=row["dimensions"][0], referral_path=referrer)
-                    page_view_id += 1
-                    sql_inserts.append(p.sql())
+                views_per_session = page_views // sessions
+                
+                for _ in range(sessions):
+                    session_id = uuid.uuid4()
+                    
+                    # Add one session
+                    sql_inserts.append(Session(
+                        session_id=session_id, website_id=website_id, created_at=timestamp_ms,
+                        hostname=hostname, browser=browser, os=os_name, device=device,
+                        screen=screen, language=language, country=country
+                    ).sql())
+                    
+                    # Add multiple page views for this session
+                    for _ in range(views_per_session):
+                        sql_inserts.append(PageView(
+                            event_id=uuid.uuid4(), website_id=website_id, session_id=session_id,
+                            created_at=timestamp_ms, url_path=url_path, referrer_path=referrer
+                        ).sql())
 
-    sql_inserts.extend([
-        f"SELECT pg_catalog.setval('public.pageview_view_id_seq', {page_view_id}, true);",
-        f"SELECT pg_catalog.setval('public.session_session_id_seq', {session_id}, true);"
-    ])
+            else:  # One page view for each, rest for the last session
+                last_session_id = None
+                
+                # Create sessions with one page view each
+                for _ in range(sessions):
+                    session_id = uuid.uuid4()
+                    last_session_id = session_id
+                    
+                    sql_inserts.append(Session(
+                        session_id=session_id, website_id=website_id, created_at=timestamp_ms,
+                        hostname=hostname, browser=browser, os=os_name, device=device,
+                        screen=screen, language=language, country=country
+                    ).sql())
+                    
+                    sql_inserts.append(PageView(
+                        event_id=uuid.uuid4(), website_id=website_id, session_id=session_id,
+                        created_at=timestamp_ms, url_path=url_path, referrer_path=referrer
+                    ).sql())
+
+                # Add remaining page views to the last session
+                for _ in range(page_views - sessions):
+                    sql_inserts.append(PageView(
+                        event_id=uuid.uuid4(), website_id=website_id, session_id=last_session_id,
+                        created_at=timestamp_ms, url_path=url_path, referrer_path=referrer
+                    ).sql())
+
     return sql_inserts
 
 
@@ -376,7 +471,7 @@ class CSVRow(NamedTuple):
         return f"{self.path},{self.browser},{self.os},{self.device},{self.screen},{self.language},{self.country},{self.referral_path},{self.count},{self.date}"
 
 
-def __migrate_transform_csv(rows):
+def _migrate_transform_csv(rows):
     csv_rows = [CSVRow.header()]
     for day, value in rows.items():
         for row in value:
@@ -393,3 +488,18 @@ def __migrate_transform_csv(rows):
                          date=day)
             csv_rows.append(row.csv())
     return csv_rows
+
+
+def _validate_config(config: dict) -> None:
+    """Validate configuration dictionary.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Raises:
+        ValueError: If required fields are missing or invalid
+    """
+    required_fields = ['serviceAccountKeyPath', 'property', 'startDate', 'endDate']
+    for field in required_fields:
+        if field not in config:
+            raise ValueError(f"Missing required config field: {field}")

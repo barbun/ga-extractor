@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/ga-extractor.svg)](https://badge.fury.io/py/ga-extractor)
 
-A CLI tool for extracting Google Analytics data using Google Reporting API. Can be also used to transform data to various formats suitable for migration to other analytics platforms.
+A CLI tool for extracting Google Analytics 4 data using Google Analytics Data API. Can be also used to transform data to various formats suitable for migration to other analytics platforms.
 
 Also see - [Goodbye, Google Analytics - Why and How You Should Leave The Platform](https://martinheinz.dev/blog/71) for more context.
 
@@ -14,11 +14,11 @@ If you find this useful, you can support me on Ko-Fi (Donations are always appre
 
 ## Setup
 
-You will need Google Cloud API access for run the CLI:
+You will need Google Cloud API access to run the CLI:
 
 - Navigate to [Cloud Resource Manager](https://console.cloud.google.com/cloud-resource-manager) and click _Create Project_
     - alternatively create project with `gcloud projects create $PROJECT_ID`
-- Navigate to [Reporting API](https://console.cloud.google.com/apis/library/analyticsreporting.googleapis.com) and click _Enable_
+- Navigate to [Analytics Data API](https://console.cloud.google.com/apis/library/analyticsdata.googleapis.com) and click _Enable_
 - Create credentials:
     - Go to [credentials page](https://console.cloud.google.com/apis/credentials)
     - Click _Create credentials_, select _Service account_
@@ -51,11 +51,10 @@ ga-extractor --help
 # Create config file:
 ga-extractor setup \
   --sa-key-path="analytics-api-24102021-4edf0b7270c0.json" \
-  --table-id="123456789" \
-  --metrics="ga:sessions" \
-  --dimensions="ga:browser" \
-  --start-date="2022-03-15" \
-  --end-date="2022-03-19"
+  --property-id="123456789" \
+  --preset="FULL" \
+  --start-date="2024-01-01" \
+  --end-date="2024-01-31"
   
 cat ~/.config/ga-extractor/config.yaml  # Optionally, check config
 
@@ -65,9 +64,10 @@ ga-extractor auth  # Test authentication
 ga-extractor setup --help  # For options and flags
 ```
 
-- Value for `--table-id` can be found in GA web console - Click on _Admin_ section, _View Settings_ and see _View ID_ field
+- Value for `--property-id` can be found in GA4 web console under Admin > Property > Property Settings > Property ID
 - All configurations and generated extracts/reports are stored in `~/.config/ga-extractor/...`
-- You can also use metrics and dimensions presets using `--preset` with `FULL` or `BASIC`, if you're not sure which data to extract
+- You can use metrics and dimensions presets using `--preset` with `FULL` or `BASIC`, if you're not sure which data to extract
+- Alternatively, specify custom metrics and dimensions using `--metrics` and `--dimensions`
 
 ### Extract
 
@@ -92,15 +92,19 @@ ga-extractor migrate --format=CSV
 
 head /home/user/.config/ga-extractor/02c2db1a-1ff0-47af-bad3-9c8bc51c1d13_extract.csv
 # path,browser,os,device,screen,language,country,referral_path,count,date
-# /,Chrome,Android,mobile,1370x1370,zh-cn,China,(direct),1,2022-03-18
-# /,Chrome,Android,mobile,340x620,en-gb,United Kingdom,t.co/,1,2022-03-18
+# /,Chrome,Android,mobile,1370x1370,zh-cn,China,(direct),1,2024-01-01
+# /,Chrome,Android,mobile,340x620,en-gb,United Kingdom,t.co/,1,2024-01-01
 
-ga-extractor migrate --format=UMAMI
+# For Umami migration, you need to provide website ID and hostname:
+ga-extractor migrate \
+  --format=UMAMI \
+  --umami-website-id="123e4567-e89b-12d3-a456-426614174000" \
+  --umami-hostname="example.com"
 # Report written to /home/user/.config/ga-extractor/cee9e1d0-3b87-4052-a295-1b7224c5ba78_extract.sql
 
 # IMPORTANT: Verify the data and check test database before inserting into production instance 
-# To insert into DB (This should be run against clean database):
-cat cee9e1d0-3b87-4052-a295-1b7224c5ba78_extract.sql | psql -Upostgres -a some-db
+# To insert into DB:
+cat cee9e1d0-3b87-4052-a295-1b7224c5ba78_extract.sql | mysql -u username -p database_name
 ```
 
 You can verify the data is correct in Umami web console and GA web console:
@@ -126,14 +130,14 @@ python -m ga_extractor --help
 ### Testing
 
 ```bash
-pytest
+poetry run pytest
 ```
 
-### Building Package
+### Installation and Usage
 
 ```bash
 poetry install
-ga-extractor --help
+poetry run ga-extractor --help
 
 # Usage: ga-extractor [OPTIONS] COMMAND [ARGS]...
 # ...
